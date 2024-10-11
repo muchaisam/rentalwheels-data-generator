@@ -5,6 +5,7 @@ const { program } = require('commander');
 const ProgressBar = require('progress');
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const sharp = require('sharp');
+const logger = require('./logger');
 
 require('dotenv').config();
 
@@ -46,7 +47,20 @@ const carModels = {
     'Volkswagen': ['Jetta', 'Tiguan', 'Passat', 'Atlas', 'Golf', 'ID.4', 'Arteon', 'Taos', 'GLI', 'GTI']
 };
 
-const categories = ['sedan', 'suv', 'hatchback', 'truck', 'luxury', 'sports', 'compact', 'midsize', 'fullsize', 'electric'];
+const categories = ['family', 'weekend trip', 'road trip', 'business', 'adventure', 'luxury', 'eco-friendly', 'group travel', 'city exploration', 'special occasion'];
+const categoryImages = {
+    'family': 'family.png',
+    'weekend trip': 'weekend_trip.png',
+    'road trip': 'road_trip.png',
+    'business': 'business.png',
+    'adventure': 'adventure.png',
+    'luxury': 'luxury.png',
+    'eco-friendly': 'eco_friendly.png',
+    'group travel': 'group_travel.png',
+    'city exploration': 'exploration.png',
+    'special occasion': 'special_occasion.png'
+};
+
 const features = ['GPS Navigation', 'Bluetooth Connectivity', 'Backup Camera', 'Cruise Control', 'Heated Seats',
     'Leather Interior', 'Sunroof', 'Lane Departure Warning', 'Blind Spot Monitor', 'Apple CarPlay/Android Auto',
     'Keyless Entry', 'Push Button Start', 'Adaptive Cruise Control', 'Parking Sensors', 'Wireless Charging'];
@@ -64,7 +78,7 @@ async function generateRandomCar() {
     let baseRate;
     if (['Mercedes-Benz', 'BMW', 'Audi'].includes(brand) || category === 'luxury') {
         baseRate = 150;
-    } else if (category === 'sports' || category === 'electric') {
+    } else if (category === 'eco-friendly' || category === 'special occasion') {
         baseRate = 120;
     } else {
         baseRate = 80;
@@ -86,7 +100,7 @@ async function generateRandomCar() {
 
     const imageUrl = await generateAndUploadCarImage(`${year} ${brand} ${model}`);
 
-    const description = `Experience the ${year} ${brand} ${model}, a ${category} vehicle that combines style, comfort, and performance. Featuring a ${engineType} engine, ${transmission} transmission, and ${fuelType} fuel system, this car offers an exceptional driving experience. With a daily rate of $${dailyRate}, it's an excellent choice for your rental needs.`;
+    const description = `Experience the ${year} ${brand} ${model}, perfect for your ${category} needs. This ${fuelType} vehicle features a ${engineType} engine with ${transmission} transmission, offering an exceptional blend of performance and comfort. With a daily rate of $${dailyRate}, it's an excellent choice for your rental needs.`;
 
     return {
         id: `car${Math.random().toString(36).substr(2, 9)}`,
@@ -108,7 +122,7 @@ async function generateRandomCar() {
 async function generateAndUploadCarImage(prompt) {
     try {
         const imageModel = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
-        console.log("Sending request to generate image for:", prompt);
+        logger.info(`Generating image for: ${prompt}`);
 
         const result = await imageModel.generateContent([
             "Generate a photo-realistic image of a car with the following description:",
@@ -150,9 +164,11 @@ async function generateAndUploadCarImage(prompt) {
             },
         });
 
-        return `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+        const imageUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+        logger.info(`Image uploaded: ${imageUrl}`);
+        return imageUrl;
     } catch (error) {
-        console.error('Error generating or uploading image:', error);
+        logger.error('Error generating or uploading image:', error);
         return 'https://example.com/placeholder-car-image.jpg';
     }
 }
@@ -172,18 +188,76 @@ function generateRandomDeal(cars) {
         discountedRate,
         validFrom: new Date().toISOString(),
         validTo: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(), // 30 days from now
+        imageUrl: car.imageUrl,
+        carDescription: car.description,
+        engineType: car.engineType,
+        transmission: car.transmission,
+        fuelType: car.fuelType
     };
 }
 
-function generateCategories() {
-    return categories.map(category => ({
-        id: category,
-        name: category.charAt(0).toUpperCase() + category.slice(1),
-        description: `A collection of ${category} vehicles available for rent.`
-    }));
+async function uploadCategoryImage(category, imageName) {
+    const imagePath = path.join(__dirname, 'assets', 'category_images', imageName);
+
+    try {
+        // Read the image file
+        const imageBuffer = await fs.readFile(imagePath);
+
+        // Resize and convert image to JPEG format
+        const resizedBuffer = await sharp(imageBuffer)
+            .resize(800, 600)
+            .toFormat('jpeg')
+            .toBuffer();
+
+        const fileName = `category_images/${category.replace(/\s+/g, '_')}_${Date.now()}.jpg`;
+        const file = bucket.file(fileName);
+
+        await file.save(resizedBuffer, {
+            metadata: {
+                contentType: 'image/jpeg',
+            },
+        });
+
+        const imageUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+        logger.info(`Category image uploaded: ${imageUrl}`);
+        return imageUrl;
+    } catch (error) {
+        logger.error(`Error uploading category image for ${category}:`, error);
+        throw error;
+    }
 }
 
-async function populateCollection(collectionName, data, bar) {
+async function generateCategories() {
+    const categoryPromises = categories.map(async (category) => {
+        const imageName = categoryImages[category];
+        let imageUrl;
+        try {
+            imageUrl = await uploadCategoryImage(category, imageName);
+        } catch (error) {
+            logger.error(`Failed to upload image for category ${category}. Using placeholder.`);
+            imageUrl = 'https://example.com/placeholder-category-image.jpg';
+        }
+
+        return {
+            id: category.replace(/\s+/g, '-'),
+            name: category.charAt(0).toUpperCase() + category.slice(1),
+            description: `A collection of vehicles perfect for ${category}.`,
+            imageUrl: imageUrl
+        };
+    });
+
+    return Promise.all(categoryPromises);
+}
+
+async function populateCollection(collectionName, data, bar, dryRun = false) {
+    if (dryRun) {
+        logger.info(`Dry run: Would populate ${collectionName} with ${data.length} items`);
+        data.forEach((item) => {
+            logger.info(`Dry run: Would add item to ${collectionName}:`, item);
+        });
+        return;
+    }
+
     const batch = db.batch();
     data.forEach((item) => {
         const docRef = db.collection(collectionName).doc(item.id);
@@ -193,19 +267,20 @@ async function populateCollection(collectionName, data, bar) {
 
     try {
         await batch.commit();
-        console.log(`${collectionName} collection populated successfully`);
+        logger.info(`${collectionName} collection populated successfully`);
     } catch (error) {
-        console.error(`Error populating ${collectionName} collection:`, error);
+        logger.error(`Error populating ${collectionName} collection:`, error);
+        throw error;
     }
 }
 
 async function populateFirestore(options) {
     try {
-        console.log('Starting Firestore population...');
+        logger.info('Starting Firestore population...');
 
         // Generate random cars
         const randomCarsCount = options.randomCars;
-        console.log(`Generating ${randomCarsCount} random cars...`);
+        logger.info(`Generating ${randomCarsCount} random cars...`);
         const carBar = new ProgressBar('Generating cars [:bar] :percent :etas', { total: randomCarsCount });
         const randomCars = [];
         for (let i = 0; i < randomCarsCount; i++) {
@@ -215,7 +290,7 @@ async function populateFirestore(options) {
 
         // Generate deals
         const dealsCount = options.randomDeals || Math.floor(randomCarsCount / 5); // Default to 20% of cars
-        console.log(`Generating ${dealsCount} random deals...`);
+        logger.info(`Generating ${dealsCount} random deals...`);
         const dealBar = new ProgressBar('Generating deals [:bar] :percent :etas', { total: dealsCount });
         const deals = [];
         for (let i = 0; i < dealsCount; i++) {
@@ -224,25 +299,26 @@ async function populateFirestore(options) {
         }
 
         // Generate categories
-        const categoryData = generateCategories();
+        logger.info('Generating and uploading category images...');
+        const categoryData = await generateCategories();
 
         // Populate collections
         if (options.populateCars) {
-            console.log('Populating cars collection...');
-            await populateCollection('cars', randomCars);
+            logger.info('Populating cars collection...');
+            await populateCollection('cars', randomCars, null, options.dryRun);
         }
         if (options.populateCategories) {
-            console.log('Populating categories collection...');
-            await populateCollection('categories', categoryData);
+            logger.info('Populating categories collection...');
+            await populateCollection('categories', categoryData, null, options.dryRun);
         }
         if (options.populateDeals) {
-            console.log('Populating deals collection...');
-            await populateCollection('deals', deals);
+            logger.info('Populating deals collection...');
+            await populateCollection('deals', deals, null, options.dryRun);
         }
 
-        console.log('Firestore population completed successfully');
+        logger.info('Firestore population completed successfully');
     } catch (error) {
-        console.error('Error in Firestore population:', error);
+        logger.error('Error in Firestore population:', error);
     } finally {
         // Close the Firebase Admin SDK connection
         admin.app().delete();
@@ -250,7 +326,7 @@ async function populateFirestore(options) {
 }
 
 function validateCarData(car) {
-    const requiredFields = ['id', 'brand', 'model', 'year', 'category', 'dailyRate', 'engineType', 'transmission', 'fuelType'];
+    const requiredFields = ['id', 'brand', 'model', 'year', 'category', 'dailyRate', 'engineType', 'transmission', 'fuelType', 'description', 'imageUrl'];
     for (const field of requiredFields) {
         if (!(field in car)) {
             throw new Error(`Invalid car data: Missing ${field}`);
@@ -262,27 +338,23 @@ function validateCarData(car) {
     // Add more validation as needed
 }
 
-const logToFile = async (message) => {
-    const timestamp = new Date().toISOString();
-    const logMessage = `${timestamp}: ${message}\n`;
-    await fs.appendFile('firestore_population.log', logMessage);
-};
-
 async function cleanupCollection(collectionName) {
+    logger.info(`Cleaning up ${collectionName} collection...`);
     const snapshot = await db.collection(collectionName).get();
     const batch = db.batch();
     snapshot.docs.forEach((doc) => {
         batch.delete(doc.ref);
     });
     await batch.commit();
-    console.log(`Cleaned up ${collectionName} collection`);
+    logger.info(`Cleaned up ${collectionName} collection`);
 }
 
 async function exportCollectionToJson(collectionName) {
+    logger.info(`Exporting ${collectionName} collection to JSON...`);
     const snapshot = await db.collection(collectionName).get();
     const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
     await fs.writeFile(`${collectionName}_export.json`, JSON.stringify(data, null, 2));
-    console.log(`Exported ${collectionName} collection to ${collectionName}_export.json`);
+    logger.info(`Exported ${collectionName} collection to ${collectionName}_export.json`);
 }
 
 // Command-line interface setup
@@ -294,6 +366,7 @@ program
     .option('--populate-deals', 'Populate deals collection')
     .option('--cleanup <collection>', 'Cleanup a specific collection')
     .option('--export <collection>', 'Export a specific collection to JSON')
+    .option('--dry-run', 'Run the script without writing to Firestore')
     .parse(process.argv);
 
 const options = program.opts();
@@ -305,8 +378,8 @@ if (options.cleanup) {
     exportCollectionToJson(options.export).catch(console.error);
 } else {
     populateFirestore(options).then(() => {
-        console.log('Script execution completed');
+        logger.info('Script execution completed');
     }).catch((error) => {
-        console.error('Script execution failed:', error);
+        logger.error('Script execution failed:', error);
     });
 }
